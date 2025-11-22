@@ -1,0 +1,75 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+RF24 radio(9, 10); // CE, CSN pins for Nano
+const byte address[6] = "00001";
+
+#define LED_PIN 3
+#define BUZZER_PIN 4
+
+struct DataPacket {
+  int blink;
+  int alcohol;
+  int button;
+};
+
+DataPacket data;
+
+void setup() {
+  Serial.begin(115200);  // UPDATED BAUD RATE
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  if (!radio.begin()) {
+    Serial.println("NRF NOT FOUND!");
+  } else {
+    radio.openReadingPipe(0, address);
+    radio.setPALevel(RF24_PA_LOW);
+    radio.startListening();
+    Serial.println("NRF Receiver Ready...");
+  }
+}
+
+void loop() {
+
+  if (radio.available()) {
+    radio.read(&data, sizeof(data));
+
+    Serial.print("Blink: ");
+    Serial.print(data.blink);
+    Serial.print(" | Alcohol: ");
+    Serial.print(data.alcohol);
+    Serial.print(" | Button: ");
+    Serial.println(data.button);
+
+    /************ EYE BLINK ALERT ************/
+    if (data.blink == 1) {
+      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+
+    /************ ALCOHOL ALERT ************/
+    if (data.alcohol == 1) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(500);
+      digitalWrite(LED_PIN, LOW);
+      delay(300);
+    }
+
+    /************ BUTTON ALERT ************/
+    if (data.button == 1) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+}
