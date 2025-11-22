@@ -1,0 +1,82 @@
+/*****************************************************
+   NRF24 TRANSMITTER (ESP32)
+   Sends: blink, alcohol, button
+*****************************************************/
+
+#include <SPI.h>
+#include <RF24.h>
+
+/************* PIN DEFINITIONS *************/
+#define BLINK_PIN 27
+#define BUTTON_PIN 14
+#define MQ3_PIN 34
+
+RF24 radio(4, 5); // CE=4, CSN=5
+const byte address[6] = "00001";
+
+/************* PACKET STRUCT *************/
+struct DataPacket {
+  int blink;
+  int alcohol;
+  int button;
+};
+
+DataPacket packet;
+
+bool firstBlink = false;
+bool firstBtn = false;
+bool firstMQ = false;
+
+/************* SETUP *************/
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BLINK_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if (!radio.begin()) {
+    Serial.println("NRF NOT FOUND!");
+  } else {
+    radio.openWritingPipe(address);
+    radio.setPALevel(RF24_PA_LOW);
+    radio.stopListening();
+    Serial.println("NRF Ready!");
+  }
+}
+
+/************* LOOP *************/
+void loop() {
+
+  packet.blink = 0;
+  packet.alcohol = 0;
+  packet.button = 0;
+
+  // EYE BLINK
+  int blinkVal = digitalRead(BLINK_PIN);
+  if (!firstBlink) firstBlink = true;
+  else if (blinkVal == LOW) {
+    packet.blink = 1;
+    Serial.println("Blink Detected!");
+  }
+
+  // BUTTON PRESS
+  int btnVal = digitalRead(BUTTON_PIN);
+  if (!firstBtn) firstBtn = true;
+  else if (btnVal == LOW) {
+    packet.button = 1;
+    Serial.println("Button Pressed!");
+  }
+
+  // ALCOHOL MQ3
+  int mq = analogRead(MQ3_PIN);
+  if (!firstMQ) firstMQ = true;
+  else if (mq > 1200) {
+    packet.alcohol = 1;
+    Serial.println("Alcohol Detected!");
+  }
+
+  // SEND PACKET
+  radio.write(&packet, sizeof(packet));
+  Serial.println("Sent");
+  delay(100);
+}
