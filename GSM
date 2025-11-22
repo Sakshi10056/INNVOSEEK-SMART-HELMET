@@ -1,0 +1,269 @@
+/* ESP32: ADXL335 crash detection + MQ3 + blink + button + NRF24 + SIM900 alert
+   Wiring summary (repeat):
+    - ADXL335 VCC -> 3.3V, GND -> GND
+    - ADXL Xout -> GPIO32
+    - ADXL Yout -> GPIO33
+    - ADXL Zout -> GPIO35
+    - MQ3 -> GPIO34 (analog)
+    - Blink sensor -> GPIO27 (digital)
+    - Button -> GPIO14 (digital, pullup)
+    - NRF24 CE->4 CSN->5 MOSI->23 MISO->19 SCK->18 VCC->3.3V GND->GND
+    - SIM900 TX -> GPIO16, RX -> GPIO17 (UART2)
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <HardwareSerial.h>
+#include <math.h>
+
+// --- pins
+#define ADXL_X_PIN 32   // ADC1_CH4
+#define ADXL_Y_PIN 33   // ADC1_CH5
+#define ADXL_Z_PIN 35   // ADC1_CH7 (input only)
+#define MQ3_PIN     34
+
+#define BLINK_PIN   27
+#define BUTTON_PIN  14
+
+// NRF24
+RF24 radio(4, 5); // CE, CSN
+const byte address[6] = "00001";
+
+// SIM900 (HardwareSerial on UART2)
+HardwareSerial SimSerial(2); // RX2=16, TX2=17
+
+// alert phone
+const char PHONE_NUMBER[] = "+919113770450"; // <-- set target number
+const char SMS_MESSAGE[] = "ALERT: Crash detected! Please check rider.";
+
+unsigned long lastAlertMillis = 0;
+const unsigned long ALERT_COOLDOWN_MS = 60000UL; // 60 seconds cooldown
+
+// ADXL335 conversion constants (starting values)
+const float VCC = 3.3f;
+const int ADC_MAX = 4095; // 12-bit ADC on ESP32
+float Vref = VCC / 2.0f; // ADXL output at 0g ≈ Vcc/2
+float SENSITIVITY_MV_PER_G = 300.0f; // approx 300 mV/g typical (tweak if needed)
+
+// crash detection params
+const float CRASH_THRESHOLD_G = 5.0f; // trigger threshold (in g)
+const int SAMPLE_WINDOW = 5;        // number of sequential samples to check
+const unsigned long SAMPLE_INTERVAL_MS = 40; // sample every 40ms -> 25 Hz
+
+// packet struct for NRF
+struct DataPacket {
+  int blink;
+  int alcohol;
+  int button;
+};
+DataPacket packet;
+
+// first-read flags to discard first noisy read
+bool firstBlink = false;
+bool firstBtn = false;
+bool firstMQ = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("ESP32 Crash Detector + NRF + SIM900 Starting...");
+
+  // sensors
+  pinMode(BLINK_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // start SIM900 serial
+  SimSerial.begin(9600, SERIAL_8N1, 16, 17);
+  delay(200);
+
+  // initialize NRF
+  if (!radio.begin()) {
+    Serial.println("NRF NOT FOUND!");
+  } else {
+    radio.openWritingPipe(address);
+    radio.setPALevel(RF24_PA_LOW);
+    radio.stopListening();
+    Serial.println("NRF Ready");
+  }
+
+  // wake up SIM900 a bit (optional safety)
+  delay(500);
+  sendAT("AT");
+  delay(200);
+  sendAT("AT+CMGF=1"); // SMS text mode
+  delay(200);
+
+  // calibrate vref (optional auto-calibration at startup)
+  calibrateADXLOffsets();
+}
+
+// Read and auto-calibrate ADXL resting bias (simple)
+void calibrateADXLOffsets() {
+  const int CAL_SAMPLES = 50;
+  long sx = 0, sy = 0, sz = 0;
+  Serial.println("Calibrating ADXL (keep device still)...");
+  delay(500);
+  for (int i = 0; i < CAL_SAMPLES; ++i) {
+    sx += analogRead(ADXL_X_PIN);
+    sy += analogRead(ADXL_Y_PIN);
+    sz += analogRead(ADXL_Z_PIN);
+    delay(20);
+  }
+  float ax = sx / (float)CAL_SAMPLES;
+  float ay = sy / (float)CAL_SAMPLES;
+  float az = sz / (float)CAL_SAMPLES;
+  float vx = ax * (VCC / ADC_MAX);
+  float vy = ay * (VCC / ADC_MAX);
+  float vz = az * (VCC / ADC_MAX);
+
+  // Use average of axes as Vref estimate (approx Vcc/2)
+  Vref = (vx + vy + vz) / 3.0f;
+  Serial.print("Calibration done. Vref ~ ");
+  Serial.println(Vref, 3);
+  Serial.println("If magnitude at rest ≠ ~1.0g, tweak SENSITIVITY_MV_PER_G.");
+}
+
+void loop() {
+  // sample sensors and build NRF packet
+  packet.blink = 0;
+  packet.alcohol = 0;
+  packet.button = 0;
+
+  // blink
+  int blinkVal = digitalRead(BLINK_PIN);
+  if (!firstBlink) firstBlink = true;
+  else if (blinkVal == LOW) {
+    packet.blink = 1;
+    Serial.println("Blink Detected");
+  }
+
+  // button
+  int btn = digitalRead(BUTTON_PIN);
+  if (!firstBtn) firstBtn = true;
+  else if (btn == LOW) {
+    packet.button = 1;
+    Serial.println("Button Pressed");
+  }
+
+  // MQ3
+  int mqraw = analogRead(MQ3_PIN);
+  if (!firstMQ) firstMQ = true;
+  else {
+    if (mqraw > 1200) {
+      packet.alcohol = 1;
+      Serial.println("Alcohol Detected");
+    }
+  }
+
+  // send NRF packet (so Nano behavior unchanged)
+  radio.write(&packet, sizeof(packet));
+  // debug
+  Serial.println("NRF Packet Sent");
+
+  // *** Crash detection from ADXL335 ***
+  // perform SAMPLE_WINDOW readings spaced SAMPLE_INTERVAL_MS apart,
+  // look for magnitude > CRASH_THRESHOLD_G in at least 1 sample and confirm over subsequent samples
+  bool crash_confirmed = false;
+  int exceed_count = 0;
+  float peakMag = 0.0f;
+
+  for (int s = 0; s < SAMPLE_WINDOW; ++s) {
+    float gx = readAxisG(ADXL_X_PIN);
+    float gy = readAxisG(ADXL_Y_PIN);
+    float gz = readAxisG(ADXL_Z_PIN);
+
+    float mag_g = sqrt(gx*gx + gy*gy + gz*gz);
+    if (mag_g > peakMag) peakMag = mag_g;
+
+    Serial.print("mag_g: "); Serial.println(mag_g, 3);
+
+    if (mag_g >= CRASH_THRESHOLD_G) {
+      exceed_count++;
+    }
+    delay(SAMPLE_INTERVAL_MS);
+  }
+
+  // Decide
+  if (exceed_count >= 1) { // at least one sample exceeded threshold within this window
+    // additional safety: ensure last alert > cooldown
+    unsigned long now = millis();
+    if (now - lastAlertMillis > ALERT_COOLDOWN_MS) {
+      crash_confirmed = true;
+      lastAlertMillis = now;
+    }
+  }
+
+  if (crash_confirmed) {
+    Serial.print("CRASH CONFIRMED! Peak_g=");
+    Serial.println(peakMag, 2);
+    // send SMS + call with SIM900
+    sendSMSAlert();
+    makeCall();
+    // optionally send a special NRF packet or set packet fields here
+    // e.g., set packet.button=1 to indicate crash to receiver and re-send
+    packet.button = 1; // reuse button field for crash signalling
+    radio.write(&packet, sizeof(packet));
+    Serial.println("Crash notification transmitted via NRF as well.");
+  }
+
+  // main loop delay; adjust as needed
+  delay(200);
+}
+
+// Read raw ADC and convert to g using Vref and sensitivity
+float readAxisG(int pin) {
+  int raw = analogRead(pin);
+  float voltage = raw * (VCC / ADC_MAX);     // volts
+  float delta = voltage - Vref;               // volts above/below zero-g
+  float g = delta / (SENSITIVITY_MV_PER_G / 1000.0f);
+  return g;
+}
+
+/************* SIM900 helpers ************/
+void sendAT(const char *cmd) {
+  Serial.print("> "); Serial.println(cmd);
+  SimSerial.println(cmd);
+  delay(300);
+  readSimResponse(400);
+}
+
+void readSimResponse(unsigned long timeout) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeout) {
+    while (SimSerial.available()) {
+      char c = SimSerial.read();
+      Serial.write(c);
+    }
+  }
+}
+
+void sendSMSAlert() {
+  Serial.println("Sending SMS alert...");
+  SimSerial.print("AT+CMGF=1\r");
+  delay(200);
+  SimSerial.print("AT+CMGS=\"");
+  SimSerial.print(PHONE_NUMBER);
+  SimSerial.print("\"\r");
+  delay(200);
+  SimSerial.print(SMS_MESSAGE);
+  SimSerial.write(26); // Ctrl+Z
+  delay(3000);
+  readSimResponse(2000);
+  Serial.println("SMS send command issued.");
+}
+
+void makeCall() {
+  Serial.println("Dialing alert number...");
+  SimSerial.print("ATD");
+  SimSerial.print(PHONE_NUMBER);
+  SimSerial.print(";\r");
+  delay(1000);
+  readSimResponse(2000);
+  // let it ring for 20 sec then hang up
+  delay(20000);
+  SimSerial.println("ATH"); // hangup
+  delay(400);
+  readSimResponse(400);
+  Serial.println("Call ended.");
+}
